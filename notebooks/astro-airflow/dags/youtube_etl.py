@@ -41,12 +41,13 @@ with DAG(
     schedule_interval='@daily',  # Runs daily
     catchup=False
 ) as dag:
-
+    
     @task
     def create_table():
         create_table_query = """
         CREATE TABLE IF NOT EXISTS youtube_comments (
             id SERIAL PRIMARY KEY,
+            comment_id VARCHAR(50) UNIQUE,  
             author VARCHAR(255),
             comment TEXT,
             cleaned_comment TEXT,
@@ -58,13 +59,14 @@ with DAG(
         with postgres_hook.get_conn() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(create_table_query)
-                conn.commit()
+                conn.commit()    
+
 
     @task
     def get_comments(video_id):
-        API_KEY = os.getenv('YOUTUBE_API_KEY')  # Load API key from environment variable
+        API_KEY = os.getenv('YOUTUBE_API_KEY')
         youtube = build('youtube', 'v3', developerKey=API_KEY)
-        
+
         request = youtube.commentThreads().list(
             part='snippet',
             videoId=video_id,
@@ -75,13 +77,19 @@ with DAG(
         comments = []
         for item in response['items']:
             comment = item['snippet']['topLevelComment']['snippet']
+            comment_id = item['snippet']['topLevelComment']['id']  # Fetch comment ID
+
             comments.append({
+                'Comment_ID': comment_id,
                 'Author': comment['authorDisplayName'],
                 'Comment': comment['textDisplay'],
                 'Likes': comment['likeCount'],
                 'Published At': comment['publishedAt']
             })
+
         return pd.DataFrame(comments)
+
+
 
     @task
     def preprocess_comments(comments_df):
@@ -95,18 +103,23 @@ with DAG(
 
         comments_df['Cleaned_Comment'] = comments_df['Comment'].apply(clean_text)
         return comments_df
+    
 
     @task
     def load_to_postgres(preprocessed_df):
         postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
+
         insert_query = """
-        INSERT INTO youtube_comments (author, comment, cleaned_comment, likes, published_at)
-        VALUES (%s, %s, %s, %s, %s);
+        INSERT INTO youtube_comments (comment_id, author, comment, cleaned_comment, likes, published_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (comment_id) DO NOTHING;  -- Ignore duplicates
         """
+
         with postgres_hook.get_conn() as conn:
             with conn.cursor() as cursor:
                 for _, row in preprocessed_df.iterrows():
                     cursor.execute(insert_query, (
+                        row['Comment_ID'],
                         row['Author'],
                         row['Comment'],
                         row['Cleaned_Comment'],
@@ -114,6 +127,8 @@ with DAG(
                         row['Published At']
                     ))
                 conn.commit()
+
+
 
     # ✅ Ensure these are indented within the DAG context
     video_id = 'jxCrE2KH7Nk'  # Replace with an actual YouTube video ID
