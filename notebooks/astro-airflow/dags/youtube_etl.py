@@ -93,6 +93,8 @@ with DAG(
 
     @task
     def preprocess_comments(comments_df):
+        import nltk
+        nltk.download('stopwords')  # Downloads each time (inefficient)
         stop_words = set(stopwords.words('english'))
 
         def clean_text(text):
