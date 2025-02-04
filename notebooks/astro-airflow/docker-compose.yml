@@ -5,7 +5,7 @@ services:
     image: postgres:15
     container_name: postgres_db
     environment:
-      POSTGRES_USER: astro dev bash
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
     ports:

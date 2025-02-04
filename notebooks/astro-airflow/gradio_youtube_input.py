@@ -1,14 +1,21 @@
 import gradio as gr
 from googleapiclient.discovery import build
-from airflow.providers.postgres.hooks.postgres import PostgresHook
 from dotenv import load_dotenv
 import os
+import psycopg2
 
 # Load environment variables
 load_dotenv()
 
 # YouTube API key
 API_KEY = os.getenv('YOUTUBE_API_KEY')
+
+# PostgreSQL connection details
+DB_HOST = 'localhost'
+DB_PORT = '5432'
+DB_NAME = 'postgres'
+DB_USER = 'postgres'
+DB_PASSWORD = 'postgres'
 
 # Function to create the input_youtubeid table if it doesn't exist
 def create_input_youtubeid_table():
@@ -19,11 +26,17 @@ def create_input_youtubeid_table():
         date_added TIMESTAMP DEFAULT NOW()
     );
     """
-    postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
-    with postgres_hook.get_conn() as conn:
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+    with conn:
         with conn.cursor() as cursor:
             cursor.execute(create_table_query)
-            conn.commit()
+    conn.close()
 
 # Function to validate YouTube video ID
 def validate_youtube_id(video_id):
@@ -45,16 +58,22 @@ def validate_youtube_id(video_id):
 # Function to insert video ID into PostgreSQL
 def insert_video_id(video_id):
     create_input_youtubeid_table()  # Ensure the table exists before inserting
-    postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
     insert_query = """
     INSERT INTO input_youtubeid (video_id, date_added)
     VALUES (%s, NOW())
     ON CONFLICT (video_id) DO NOTHING;  -- Prevent duplicate entries
     """
-    with postgres_hook.get_conn() as conn:
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+    with conn:
         with conn.cursor() as cursor:
             cursor.execute(insert_query, (video_id,))
-            conn.commit()
+    conn.close()
 
 # Gradio Interface Function
 def submit_video_id(video_id):

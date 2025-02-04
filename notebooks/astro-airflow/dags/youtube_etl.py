@@ -17,9 +17,11 @@ from dotenv import load_dotenv
 import os
 
 # For text preprocessing
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
-from nltk.corpus import stopwords
 import emoji
+
+
 
 # Load environment variables
 load_dotenv()
@@ -90,12 +92,9 @@ with DAG(
         return pd.DataFrame(comments)
 
 
-
     @task
     def preprocess_comments(comments_df):
-        import nltk
-        nltk.download('stopwords')  # Downloads each time (inefficient)
-        stop_words = set(stopwords.words('english'))
+        stop_words = ENGLISH_STOP_WORDS  # Built-in stopwords from scikit-learn
 
         def clean_text(text):
             text = re.sub(r'http\S+|www\.\S+', '', text)  # Remove URLs
@@ -105,6 +104,7 @@ with DAG(
 
         comments_df['Cleaned_Comment'] = comments_df['Comment'].apply(clean_text)
         return comments_df
+
     
 
     @task
