@@ -2,7 +2,7 @@
 
 # Airflow libraries
 from airflow import DAG
-from airflow.decorators import task
+from airflow.decorators import task, dag
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, timedelta
 
@@ -20,8 +20,6 @@ import os
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
 import emoji
-
-
 
 # Load environment variables
 load_dotenv()
@@ -43,26 +41,38 @@ with DAG(
     schedule_interval='@daily',  # Runs daily
     catchup=False
 ) as dag:
-    
+
     @task
     def create_table():
         create_table_query = """
         CREATE TABLE IF NOT EXISTS youtube_comments (
             id SERIAL PRIMARY KEY,
-            comment_id VARCHAR(50) UNIQUE,  
+            comment_id VARCHAR(50),
+            video_id VARCHAR(50),
             author VARCHAR(255),
             comment TEXT,
             cleaned_comment TEXT,
             likes INTEGER,
-            published_at TIMESTAMP
+            published_at TIMESTAMP,
+            sentiment VARCHAR(20),
+            UNIQUE (comment_id, video_id)  -- Composite key to avoid duplicates
         );
         """
         postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
         with postgres_hook.get_conn() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(create_table_query)
-                conn.commit()    
+                conn.commit()
 
+    @task
+    def fetch_video_ids():
+        postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
+        fetch_query = "SELECT video_id FROM input_youtubeid;"
+        with postgres_hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(fetch_query)
+                video_ids = [row[0] for row in cursor.fetchall()]
+        return video_ids
 
     @task
     def get_comments(video_id):
@@ -83,17 +93,18 @@ with DAG(
 
             comments.append({
                 'Comment_ID': comment_id,
+                'Video_ID': video_id,
                 'Author': comment['authorDisplayName'],
                 'Comment': comment['textDisplay'],
                 'Likes': comment['likeCount'],
-                'Published At': comment['publishedAt']
+                'Published At': comment['publishedAt'],
+                'Sentiment': None  # Placeholder for sentiment analysis
             })
 
-        return pd.DataFrame(comments)
-
+        return comments  # Return list of comments (dicts)
 
     @task
-    def preprocess_comments(comments_df):
+    def preprocess_comments(comments_list):
         stop_words = ENGLISH_STOP_WORDS  # Built-in stopwords from scikit-learn
 
         def clean_text(text):
@@ -102,42 +113,43 @@ with DAG(
             text = ' '.join([word for word in text.split() if word.lower() not in stop_words])  # Remove stop words
             return text
 
-        comments_df['Cleaned_Comment'] = comments_df['Comment'].apply(clean_text)
-        return comments_df
-
-    
+        for comment in comments_list:
+            comment['Cleaned_Comment'] = clean_text(comment['Comment'])
+        return comments_list
 
     @task
-    def load_to_postgres(preprocessed_df):
+    def load_to_postgres(preprocessed_comments):
         postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
 
         insert_query = """
-        INSERT INTO youtube_comments (comment_id, author, comment, cleaned_comment, likes, published_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (comment_id) DO NOTHING;  -- Ignore duplicates
+        INSERT INTO youtube_comments (comment_id, video_id, author, comment, cleaned_comment, likes, published_at, sentiment)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (comment_id, video_id) DO NOTHING;  -- Ignore duplicates
         """
 
         with postgres_hook.get_conn() as conn:
             with conn.cursor() as cursor:
-                for _, row in preprocessed_df.iterrows():
+                for comment in preprocessed_comments:
                     cursor.execute(insert_query, (
-                        row['Comment_ID'],
-                        row['Author'],
-                        row['Comment'],
-                        row['Cleaned_Comment'],
-                        row['Likes'],
-                        row['Published At']
+                        comment['Comment_ID'],
+                        comment['Video_ID'],
+                        comment['Author'],
+                        comment['Comment'],
+                        comment['Cleaned_Comment'],
+                        comment['Likes'],
+                        comment['Published At'],
+                        comment['Sentiment']  # Currently None
                     ))
                 conn.commit()
 
-
-
     # ✅ Ensure these are indented within the DAG context
-    video_id = 'jxCrE2KH7Nk'  # Replace with an actual YouTube video ID
     create_table_task = create_table()
-    comments_task = get_comments(video_id)
-    preprocessed_comments_task = preprocess_comments(comments_task)
-    load_data_task = load_to_postgres(preprocessed_comments_task)
+    video_ids_task = fetch_video_ids()
+
+    # Dynamic Task Mapping
+    comments_task = get_comments.expand(video_id=video_ids_task)
+    preprocessed_comments_task = preprocess_comments.expand(comments_list=comments_task)
+    load_data_task = load_to_postgres.expand(preprocessed_comments=preprocessed_comments_task)
 
     # ✅ Task dependencies
-    create_table_task >> comments_task >> preprocessed_comments_task >> load_data_task
+    create_table_task >> video_ids_task >> comments_task >> preprocessed_comments_task >> load_data_task
