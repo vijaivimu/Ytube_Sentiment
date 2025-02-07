@@ -2,7 +2,7 @@
 
 # Airflow libraries
 from airflow import DAG
-from airflow.decorators import task, dag
+from airflow.decorators import task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, timedelta
 
