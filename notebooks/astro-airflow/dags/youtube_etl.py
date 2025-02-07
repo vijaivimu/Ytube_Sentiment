@@ -21,6 +21,10 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
 import emoji
 
+# For Sentiment Analysis
+from transformers import pipeline
+
+
 # Load environment variables
 load_dotenv()
 
@@ -142,6 +146,45 @@ with DAG(
                     ))
                 conn.commit()
 
+    @task
+    def sentiment_analysis():
+        postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
+
+        # Fetch comments where Sentiment is NULL
+        fetch_query = """
+        SELECT comment_id, cleaned_comment FROM youtube_comments WHERE sentiment IS NULL;
+        """
+
+        with postgres_hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(fetch_query)
+                comments = cursor.fetchall()
+
+        if not comments:
+            return "No comments to process"
+
+        # Load sentiment analysis model
+        pipe = pipeline("text-classification", model="distilbert/distilbert-base-uncased-finetuned-sst-2-english")
+
+        # Process each comment
+        update_data = []
+        for comment_id, cleaned_comment in comments:
+            sentiment_result = pipe(cleaned_comment)[0]['label']
+            sentiment = "positive" if sentiment_result == "POSITIVE" else "negative"
+            update_data.append((sentiment, comment_id))
+
+        # Update sentiment in PostgreSQL
+        update_query = """
+        UPDATE youtube_comments SET sentiment = %s WHERE comment_id = %s;
+        """
+
+        with postgres_hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.executemany(update_query, update_data)
+                conn.commit()
+
+        return f"Updated sentiment for {len(update_data)} comments"
+
     # ✅ Ensure these are indented within the DAG context
     create_table_task = create_table()
     video_ids_task = fetch_video_ids()
@@ -150,6 +193,7 @@ with DAG(
     comments_task = get_comments.expand(video_id=video_ids_task)
     preprocessed_comments_task = preprocess_comments.expand(comments_list=comments_task)
     load_data_task = load_to_postgres.expand(preprocessed_comments=preprocessed_comments_task)
+    sentiment_analysis_task = sentiment_analysis()
 
     # ✅ Task dependencies
-    create_table_task >> video_ids_task >> comments_task >> preprocessed_comments_task >> load_data_task
+    create_table_task >> video_ids_task >> comments_task >> preprocessed_comments_task >> load_data_task >> sentiment_analysis_task
