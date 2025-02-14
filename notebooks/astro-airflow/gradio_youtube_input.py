@@ -3,6 +3,7 @@ from googleapiclient.discovery import build
 from dotenv import load_dotenv
 import os
 import psycopg2
+import requests  # Import requests to call Airflow API
 import pandas as pd
 
 # Load environment variables
@@ -18,15 +19,20 @@ DB_NAME = 'postgres'
 DB_USER = 'postgres'
 DB_PASSWORD = 'postgres'
 
-# Function to fetch all stored video sentiment data (Runs every time UI updates)
+# Airflow API details
+AIRFLOW_URL = "http://localhost:8080/api/v1/dags/youtube_comment_extractor/dagRuns"
+AIRFLOW_USERNAME = "admin"
+AIRFLOW_PASSWORD = "admin"
+
 def fetch_sentiment_data():
     query = """
-    SELECT i.video_id, i.video_title, 
+    SELECT i.video_id, i.video_title, i.date_added,
            COUNT(c.sentiment) FILTER (WHERE c.sentiment = 'positive') AS positive_count,
            COUNT(c.sentiment) FILTER (WHERE c.sentiment = 'negative') AS negative_count
     FROM input_youtubeid i
     LEFT JOIN youtube_comments c ON i.video_id = c.video_id
-    GROUP BY i.video_id, i.video_title;
+    GROUP BY i.video_id, i.video_title, i.date_added
+    ORDER BY i.date_added DESC;
     """
     
     conn = psycopg2.connect(
@@ -43,22 +49,55 @@ def fetch_sentiment_data():
             results = cursor.fetchall()
     
     if not results:
-        return pd.DataFrame(columns=["Video ID", "Title", "Sentiment"])
-    
-    # Process data into a DataFrame
-    data = []
-    for video_id, title, pos_count, neg_count in results:
+        return "<p>No data available.</p>"
+
+    # Create HTML table with sentiment meters
+    table_html = "<table style='width:100%; border-collapse: collapse;'>"
+    table_html += """
+    <tr style='background-color: #222; color: white;'>
+        <th style='padding: 8px;'>Date Added</th>
+        <th style='padding: 8px;'>Video ID</th>
+        <th style='padding: 8px;'>Title</th>
+        <th style='padding: 8px;'>Positive Sentiment</th>
+    </tr>
+    """
+
+    from datetime import datetime
+    for video_id, title, date_added, pos_count, neg_count in results:
         total = (pos_count or 0) + (neg_count or 0)
-        if total > 0:
-            positive_percentage = (pos_count / total) * 100
-            negative_percentage = (neg_count / total) * 100
-            sentiment_summary = f"{positive_percentage:.1f}% Positive | {negative_percentage:.1f}% Negative"
+
+        # ✅ Fix: Show "Processing" if no sentiment is available yet
+        if total == 0:
+            progress_bar_html = "<p style='color: yellow; text-align: center;'>⏳ Processing...</p>"
         else:
-            sentiment_summary = "⏳ Sentiment analysis in progress, try later."
-        
-        data.append([video_id, title, sentiment_summary])
-    
-    return pd.DataFrame(data, columns=["Video ID", "Title", "Sentiment"])
+            positive_percentage = (pos_count / total) * 100
+            progress_bar_html = f"""
+            <div style="width: 100%; background-color: #444; border-radius: 5px; padding: 2px;">
+                <div style="width: {positive_percentage}%; height: 15px; background-color: #4CAF50; border-radius: 5px;"></div>
+            </div>
+            <p style="font-size: 12px; text-align: center; margin: 5px 0;">{positive_percentage:.1f}% Positive</p>
+            """
+
+        # Convert `date_added` to datetime object before formatting
+        if isinstance(date_added, str):  
+            try:
+                date_added = datetime.strptime(date_added, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+        formatted_date = date_added.strftime("%Y-%m-%d %H:%M:%S") if isinstance(date_added, datetime) else date_added
+
+        table_html += f"""
+        <tr style='background-color: #333; color: white;'>
+            <td style='padding: 8px; text-align: center;'>{formatted_date}</td>
+            <td style='padding: 8px; text-align: center;'>{video_id}</td>
+            <td style='padding: 8px;'>{title}</td>
+            <td style='padding: 8px; text-align: center;'>{progress_bar_html}</td>
+        </tr>
+        """
+
+    table_html += "</table>"
+    return table_html
 
 # Function to validate YouTube video ID and get title
 def validate_youtube_id(video_id):
@@ -97,36 +136,17 @@ def insert_video_id(video_id, video_title):
             cursor.execute(insert_query, (video_id, video_title))
     conn.close()
 
-# Function to fetch sentiment analysis results for a given video_id
-def get_sentiment_summary(video_id):
-    query = """
-    SELECT COUNT(*) FILTER (WHERE sentiment = 'positive') AS positive_count,
-           COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative_count
-    FROM youtube_comments WHERE video_id = %s;
-    """
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD
-    )
-    with conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query, (video_id,))
-            result = cursor.fetchone()
+# Function to trigger Airflow DAG
+def trigger_airflow_dag(video_id):
+    headers = {"Content-Type": "application/json"}
+    data = {"conf": {"video_id": video_id}}  # Pass video_id to DAG
 
-    if result:
-        positive_count, negative_count = result
-        total = positive_count + negative_count
-        if total == 0:
-            return "⏳ Sentiment analysis in progress, try later."
+    response = requests.post(AIRFLOW_URL, auth=(AIRFLOW_USERNAME, AIRFLOW_PASSWORD), json=data, headers=headers)
 
-        positive_percentage = (positive_count / total) * 100
-        negative_percentage = (negative_count / total) * 100
-
-        return f"📊 {positive_percentage:.1f}% Positive | {negative_percentage:.1f}% Negative"
-    return "⏳ Sentiment analysis in progress, try later."
+    if response.status_code == 200:
+        return "✅ Airflow DAG triggered successfully!"
+    else:
+        return f"❌ Failed to trigger Airflow DAG: {response.text}"
 
 # Function to handle video submission
 def submit_video_id(video_id):
@@ -135,14 +155,14 @@ def submit_video_id(video_id):
     if is_valid:
         # Insert video into database
         insert_video_id(video_id, video_title)
-        
-        # Get sentiment analysis results
-        sentiment_result = get_sentiment_summary(video_id)
-        
+
+        # Trigger Airflow DAG
+        airflow_response = trigger_airflow_dag(video_id)
+
         # Refresh sentiment table
-        new_sentiment_table = fetch_sentiment_data()
+        new_sentiment_table_html = fetch_sentiment_data()
         
-        return f"✅ Video '{video_id}' added successfully!\n📺 Title: {video_title}\n{sentiment_result}", new_sentiment_table
+        return f"✅ Video '{video_id}' added successfully!\n📺 Title: {video_title}\n\n{airflow_response}", new_sentiment_table_html
     else:
         return f"❌ Invalid Video ID: {video_title if video_title else 'Video not found'}", fetch_sentiment_data()
 
@@ -156,11 +176,9 @@ with gr.Blocks() as iface:
         refresh_button = gr.Button("🔄 Refresh Data")
 
     sentiment_output = gr.Textbox(label="Status", interactive=False)
-    
-    # **✅ Table always fetches fresh sentiment data**
-    sentiment_table_display = gr.Dataframe(
-        value=fetch_sentiment_data, headers=["Video ID", "Title", "Sentiment"], interactive=False
-    )
+
+    # **✅ Table with Sentiment Meter inside "Positive %" column using HTML**
+    sentiment_table_display = gr.HTML(value=fetch_sentiment_data())  # Set initial value
 
     # **Submit button triggers video insertion & refreshes table**
     submit_button.click(
